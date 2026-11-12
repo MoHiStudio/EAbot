@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                              GoldScalper_XAUUSDm.mq5 |
+//|                                                         gold.mq5 |
 //|                                  Copyright 2026, Quant Trader    |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Quant Strategy EA"
 #property link      "https://www.mql5.com"
-#property version   "1.03"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -16,6 +16,11 @@ input group "=== Risk Management ==="
 input double    InpLotSize         = 0.01;      // Fixed Lot Size
 input double    InpMaxSpreadPoints = 300.0;     // Max Allowed Spread (in Points)
 input ulong     InpMagicNumber     = 109921;    // EA Magic Number
+
+input group "=== Breakeven Settings ==="
+input bool      InpUseBreakeven    = true;      // Enable Breakeven Function
+input double    InpBETriggerATR    = 1.0;       // Trigger: Profit >= ATR * Multiplier
+input double    InpBELockPoints    = 20.0;      // Profit Locked Above/Below Open (Points)
 
 input group "=== Indicator Parameters ==="
 input int       InpFastEMA         = 9;         // Fast EMA Period
@@ -40,13 +45,9 @@ double GetValidStopDistance(string symbol, double rawDistancePrice)
    long   stopsLevel  = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
    long   freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
 
-   // ব্রোকারের কঠোর সর্বনিম্ন পয়েন্ট নির্ধারণ
    long minPoints = MathMax(stopsLevel, freezeLevel);
-
-   // মাইক্রো-স্প্রেড জাম্প বা ফ্ল্যাকচুয়েশনের জন্য অতিরিক্ত ১০ পয়েন্ট বাফার
    double minAllowedDistance = (double)(minPoints + 10) * point;
 
-   // হিসাবকৃত ATR দূরত্ব এবং ব্রোকারের দূরত্বের মধ্যে যেটি বড় সেটি রিটার্ন করবে
    return MathMax(rawDistancePrice, minAllowedDistance);
 }
 
@@ -69,7 +70,6 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
 
-   // Indicators Initialization
    h_fastEMA = iMA(_Symbol, _Period, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
    h_slowEMA = iMA(_Symbol, _Period, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
    h_rsi     = iRSI(_Symbol, _Period, InpRSIPeriod, PRICE_CLOSE);
@@ -98,15 +98,93 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
+//| Check and apply Breakeven Stop Loss to open positions             |
+//+------------------------------------------------------------------+
+void ApplyBreakeven()
+{
+   if(!InpUseBreakeven) return;
+
+   double atrVal[];
+   ArraySetAsSeries(atrVal, true);
+   if(CopyBuffer(h_atr, 0, 1, 1, atrVal) < 1) return;
+
+   double triggerDist = atrVal[0] * InpBETriggerATR;
+   double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double lockOffset  = InpBELockPoints * point;
+
+   double currentBid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || 
+         PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      long   posType  = PositionGetInteger(POSITION_TYPE);
+      double openPrice= PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL= PositionGetDouble(POSITION_SL);
+      double currentTP= PositionGetDouble(POSITION_TP);
+
+      // Buy Position Check
+      if(posType == POSITION_TYPE_BUY)
+      {
+         if((currentBid - openPrice) >= triggerDist)
+         {
+            double newSL = RoundToTickSize(openPrice + lockOffset, _Symbol);
+
+            if(newSL > currentSL + (point * 2.0))
+            {
+               if(GetValidStopDistance(_Symbol, currentBid - newSL) <= (currentBid - newSL))
+               {
+                  if(trade.PositionModify(ticket, newSL, currentTP))
+                  {
+                     PrintFormat("[Breakeven Applied] BUY Ticket #%I64u -> New SL: %G (+%.1f pts)", 
+                                 ticket, newSL, InpBELockPoints);
+                  }
+               }
+            }
+         }
+      }
+      // Sell Position Check
+      else if(posType == POSITION_TYPE_SELL)
+      {
+         if((openPrice - currentAsk) >= triggerDist)
+         {
+            double newSL = RoundToTickSize(openPrice - lockOffset, _Symbol);
+
+            if(currentSL == 0.0 || newSL < currentSL - (point * 2.0))
+            {
+               if(GetValidStopDistance(_Symbol, newSL - currentAsk) <= (newSL - currentAsk))
+               {
+                  if(trade.PositionModify(ticket, newSL, currentTP))
+                  {
+                     PrintFormat("[Breakeven Applied] SELL Ticket #%I64u -> New SL: %G (+%.1f pts)", 
+                                 ticket, newSL, InpBELockPoints);
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // ১. প্রতি বারে শুধুমাত্র একবার এক্সিকিউট হবে
+   // 1. Real-time Breakeven trailing check (Runs on every tick)
+   ApplyBreakeven();
+
+   // 2. Bar completion lock (New trades execute only on closed bars)
    datetime currentBarTime = iTime(_Symbol, _Period, 0);
    if(currentBarTime == 0 || currentBarTime == lastBarTime) return;
 
-   // ২. স্প্রেড ফিল্টার চেক
+   // 3. Spread Filter Check
    long currentSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(currentSpread > InpMaxSpreadPoints)
    {
@@ -114,35 +192,19 @@ void OnTick()
       return; 
    }
 
-   // ৩. ইন্ডিকেটর বাফার লোড করা (Bar 1 = সদ্য সমাপ্ত বার, Bar 2 = তার আগের বার)
+   // 4. Indicator Buffers
    double fastEMA[], slowEMA[], rsi[], atr[];
    ArraySetAsSeries(fastEMA, true);
    ArraySetAsSeries(slowEMA, true);
    ArraySetAsSeries(rsi, true);
    ArraySetAsSeries(atr, true);
 
-   if(CopyBuffer(h_fastEMA, 0, 1, 2, fastEMA) < 2) 
-   {
-      Print("[Data Error] Fast EMA buffer load hoyni.");
-      return;
-   }
-   if(CopyBuffer(h_slowEMA, 0, 1, 2, slowEMA) < 2) 
-   {
-      Print("[Data Error] Slow EMA buffer load hoyni.");
-      return;
-   }
-   if(CopyBuffer(h_rsi, 0, 1, 2, rsi) < 2) 
-   {
-      Print("[Data Error] RSI buffer load hoyni.");
-      return;
-   }
-   if(CopyBuffer(h_atr, 0, 1, 1, atr) < 1) 
-   {
-      Print("[Data Error] ATR buffer load hoyni.");
-      return;
-   }
+   if(CopyBuffer(h_fastEMA, 0, 1, 2, fastEMA) < 2) return;
+   if(CopyBuffer(h_slowEMA, 0, 1, 2, slowEMA) < 2) return;
+   if(CopyBuffer(h_rsi, 0, 1, 2, rsi) < 2) return;
+   if(CopyBuffer(h_atr, 0, 1, 1, atr) < 1) return;
 
-   // ৪. ওপেন পজিশন চেক (একবারে সর্বোচ্চ ১টি ট্রেড)
+   // 5. Open Positions Filter (1 trade max)
    int totalOpen = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -157,31 +219,25 @@ void OnTick()
       }
    }
 
-   if(totalOpen > 0) 
-   {
-      return; // Already position open ache
-   }
+   if(totalOpen > 0) return;
 
-   // ৫. ট্রেড শর্তাবলী বিশ্লেষণ (Ongoing Trend + Momentum Re-entry)
+   // 6. Ongoing Trend & Momentum Trigger
    bool isBullishTrend = (fastEMA[0] > slowEMA[0]);
    bool isBearishTrend = (fastEMA[0] < slowEMA[0]);
 
-   // RSI ট্রিগার: ৫০ লেভেল ক্রস/বাউন্স
    bool buyTrigger  = (rsi[1] <= 50.0 && rsi[0] > 50.0);
    bool sellTrigger = (rsi[1] >= 50.0 && rsi[0] < 50.0);
 
-   // ৬. মার্কেট প্রাইস ও ব্রোকার লেভেল ভ্যালিডেশন
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    double rawSL = atr[0] * InpSLMultiplier;
    double rawTP = atr[0] * InpTPMultiplier;
 
-   // ব্রোকারের স্টপ লেভেল অনুযায়ী দূরত্ব ক্ল্যাম্প করা
    double safeSLDistance = GetValidStopDistance(_Symbol, rawSL);
    double safeTPDistance = GetValidStopDistance(_Symbol, rawTP);
 
-   // --- BUY SETUP: অনগোয়িং আপট্রেন্ড + RSI 50 ক্রস আপ ---
+   // --- BUY SETUP ---
    if(isBullishTrend && buyTrigger)
    {
       double sl = RoundToTickSize(ask - safeSLDistance, _Symbol);
@@ -195,16 +251,14 @@ void OnTick()
       }
       else
       {
-         PrintFormat("[BUY Failed] Error Code: %d (%s) | Broker Min Stop: %d pts", 
-                     trade.ResultRetcode(), 
-                     trade.ResultRetcodeDescription(),
+         PrintFormat("[BUY Failed] Error: %d (%s) | Broker Min Stop: %d pts", 
+                     trade.ResultRetcode(), trade.ResultRetcodeDescription(),
                      SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL));
       }
    }
-   // --- SELL SETUP: অনগোয়িং ডাউনট্রেন্ড + RSI 50 ক্রস ডাউন ---
+   // --- SELL SETUP ---
    else if(isBearishTrend && sellTrigger)
    {
-      // শর্ট পজিশন ক্লোজ হয় Ask প্রাইসে, তাই SL এবং TP Ask সাপেক্ষে মেপে হিসাব করা হলো
       double sl = RoundToTickSize(ask + safeSLDistance, _Symbol);
       double tp = RoundToTickSize(bid - safeTPDistance, _Symbol);
       
@@ -216,15 +270,13 @@ void OnTick()
       }
       else
       {
-         PrintFormat("[SELL Failed] Error Code: %d (%s) | Broker Min Stop: %d pts", 
-                     trade.ResultRetcode(), 
-                     trade.ResultRetcodeDescription(),
+         PrintFormat("[SELL Failed] Error: %d (%s) | Broker Min Stop: %d pts", 
+                     trade.ResultRetcode(), trade.ResultRetcodeDescription(),
                      SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL));
       }
    }
    else
    {
-      // শর্ত না মিললে স্ট্যাটাস লগ
       datetime barTime = iTime(_Symbol, _Period, 1);
       PrintFormat("[No Setup] BarTime: %s | Trend: %s | RSI[0]: %.2f (Prev: %.2f) | Trigger - Buy: %s, Sell: %s",
                   TimeToString(barTime, TIME_DATE|TIME_MINUTES),
